@@ -65,6 +65,9 @@ spec:
               value: "8080"
             - name: ASPNETCORE_ENVIRONMENT
               value: "Production"
+            - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef: { name: ecommerce-appinsights, key: APPLICATIONINSIGHTS_CONNECTION_STRING }
             - name: ConnectionStrings__DefaultConnection
               valueFrom:
                 secretKeyRef: { name: ecommerce-secret, key: ConnectionStrings__DefaultConnection }
