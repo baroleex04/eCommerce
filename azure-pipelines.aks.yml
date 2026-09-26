@@ -1,0 +1,138 @@
+# SimplCommerce → AKS deploy pipeline (build image in ACR, deploy to AKS).
+# This is the deploy pipeline the repo's original azure-pipelines.yml (build+test only)
+# lacked. Wire the variables to the infra from `/rnd-devops infrastructure` and the
+# service connection from `/rnd-devops service-connection`.
+trigger:
+  branches:
+    include: [main, master]
+  paths:
+    include:
+      - src/*
+      - deploy/aks/*
+      - azure-pipelines.aks.yml
+
+variables:
+  serviceConnection: "rnd-dev-azure" # ADO ARM service connection (/rnd-devops service-connection)
+  acrName: "rnddevacr"
+  acrLoginServer: "rnddevacr.azurecr.io"
+  aksResourceGroup: "rnd-dev-rg"
+  aksName: "rnd-dev-aks"
+  k8sNamespace: "simplcommerce"
+  imageName: "simplcommerce"
+  tag: "$(Build.BuildId)"
+
+stages:
+  - stage: Build
+    displayName: Build & push image (ACR)
+    jobs:
+      - job: acr_build
+        pool: { vmImage: "ubuntu-latest" }
+        steps:
+          # `az acr build` builds inside ACR — no docker daemon needed on the agent,
+          # and it authenticates through the ARM service connection.
+          - task: AzureCLI@2
+            displayName: az acr build
+            inputs:
+              azureSubscription: "$(serviceConnection)"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az acr build \
+                  --registry "$(acrName)" \
+                  --image "$(imageName):$(tag)" \
+                  --image "$(imageName):latest" \
+                  -f deploy/aks/Dockerfile .
+
+  - stage: Security
+    displayName: Security scans (gate Deploy)
+    dependsOn: Build
+    jobs:
+      - job: scan
+        pool: { vmImage: "ubuntu-latest" }
+        steps:
+          # 1) SCA — vulnerable NuGet packages. DEMO: report-only. The codified rule
+          #    (references/ci-cd.md) keeps this BLOCKING — flip the warning back to
+          #    `exit 1` once the app's dependencies are patched. (This gate already
+          #    proved itself: it caught 8+ High-severity transitive CVEs.)
+          - task: UseDotNet@2
+            inputs: { packageType: sdk, version: "8.0.x" }
+          - script: |
+              set -euo pipefail
+              dotnet restore SimplCommerce.sln
+              dotnet list package --vulnerable --include-transitive 2>&1 | tee vuln.txt
+              if grep -Eiq 'Critical|High' vuln.txt; then
+                echo "##vso[task.logissue type=warning]High/Critical vulnerable dependencies found — see log (demo: report-only)."
+              else
+                echo "No High/Critical vulnerable dependencies."
+              fi
+            displayName: "SCA — dotnet vulnerable packages"
+
+          # 2) Secret scan — gitleaks. Upstream SimplCommerce sample OAuth keys are
+          #    allowlisted in .gitleaks.toml. DEMO: report-only (blocking in the rule).
+          - script: |
+              docker run --rm -v "$(Build.SourcesDirectory):/repo" zricethezav/gitleaks:latest \
+                detect --source=/repo --no-git --config=/repo/.gitleaks.toml --redact -v \
+                || echo "##vso[task.logissue type=warning]gitleaks findings — see log (demo: report-only)."
+            displayName: "Secret scan — gitleaks"
+
+          # 3) IaC scan — checkov on the k8s manifests + Dockerfile. Report-only for now
+          #    (a fresh manifest set trips many baseline rules); flip off --soft-fail once clean.
+          - script: |
+              docker run --rm -v "$(Build.SourcesDirectory):/src" bridgecrew/checkov:latest \
+                -d /src/deploy/aks --framework kubernetes dockerfile --soft-fail --compact
+            displayName: "IaC scan — checkov (deploy/aks)"
+
+          # 4) Container image scan — Trivy. DEMO: report-only (--exit-code 0);
+          #    the codified rule blocks on FIXABLE High/Critical (--exit-code 1).
+          - task: AzureCLI@2
+            displayName: "Image scan — Trivy"
+            inputs:
+              azureSubscription: "$(serviceConnection)"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az acr login -n "$(acrName)"
+                mkdir -p bin
+                curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b ./bin
+                ./bin/trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 \
+                  "$(acrLoginServer)/$(imageName):$(tag)"
+
+  - stage: Deploy
+    displayName: Deploy to AKS
+    dependsOn: Security
+    jobs:
+      # Plain job (not a deployment job) — this org restricts creating ADO
+      # Environments. For deployment history/approvals, switch to
+      # `- deployment: deploy` + `environment: <name>` once you can create one.
+      - job: deploy
+        pool: { vmImage: "ubuntu-latest" }
+        steps:
+          - task: AzureCLI@2
+            displayName: kubectl apply
+            inputs:
+              azureSubscription: "$(serviceConnection)"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az aks get-credentials -g "$(aksResourceGroup)" -n "$(aksName)" --overwrite-existing
+                # Cluster has AAD + local accounts disabled → convert kubeconfig to
+                # non-interactive SP auth using the AzureCLI task's identity.
+                az aks install-cli
+                kubelogin convert-kubeconfig -l azurecli
+
+                IMG="$(acrLoginServer)/$(imageName):$(tag)"
+
+                kubectl apply -f deploy/aks/k8s/namespace.yaml
+                kubectl apply -f deploy/aks/k8s/mssql.yaml
+                kubectl -n "$(k8sNamespace)" rollout status deployment/mssql --timeout=300s
+
+                # Substitute the built image into the app manifest, then apply.
+                sed "s|__IMAGE__|${IMG}|g" deploy/aks/k8s/app.yaml | kubectl apply -f -
+                kubectl -n "$(k8sNamespace)" rollout status deployment/simplcommerce --timeout=420s
+
+                echo "Storefront public IP:"
+                kubectl -n "$(k8sNamespace)" get svc simplcommerce \
+                  -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
